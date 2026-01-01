@@ -27,6 +27,9 @@ class GPT2MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
         self.act = nn.GELU()
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.c_proj(self.act(self.c_fc(x)))
+
 class GPT2Block(nn.Module):
     def __init__(self, config: GPT2Config):
         super().__init__()
