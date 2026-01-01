@@ -18,8 +18,13 @@ class GPT2Config:
 # gpt2 model
 
 class GPT2Attention(nn.Module):
-    pass
-
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+   
 class GPT2MLP(nn.Module):
     def __init__(self, config: GPT2Config):
         super().__init__()
