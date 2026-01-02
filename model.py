@@ -2,6 +2,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+import tiktoken
+
 # Sampling utilities live in `sampling.py` to keep this file focused on model architecture.
 from sampling import SamplingConfig, generate
 
@@ -196,5 +198,9 @@ class GPT2Model(nn.Module):
 
 if __name__ == "__main__":
     model = GPT2Model.from_pretrained("gpt2")
-    print(model)
-    print(model.generate(torch.tensor([[1, 2, 3]]), 10))
+    tokenizer = tiktoken.get_encoding("gpt2")
+    text = "Hello, how are you?"
+    tokens = tokenizer.encode(text)
+    x = torch.tensor(tokens).unsqueeze(0)  # (T,) -> (1, T)
+    print(model.generate(x, 10, cfg=SamplingConfig(strategy="top_k")))
+    print(tokenizer.decode(model.generate(x, 10, cfg=SamplingConfig(strategy="top_k"))[0].tolist()))
