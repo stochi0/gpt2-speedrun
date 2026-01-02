@@ -161,6 +161,8 @@ class GPT2Model(nn.Module):
 
         return model
 
+# sampling methods
+
 @dataclass
 class SamplingConfig:
     strategy: Literal["greedy", "multinomial", "top_k", "top_p"] = "multinomial"
@@ -168,7 +170,7 @@ class SamplingConfig:
     top_k: int = 50
     top_p: float = 0.9
 
-
+# top-k sampling
 def _apply_top_k(logits: torch.Tensor, k: int) -> torch.Tensor:
     if k <= 0 or k >= logits.shape[-1]:
         return logits
@@ -176,7 +178,7 @@ def _apply_top_k(logits: torch.Tensor, k: int) -> torch.Tensor:
     cutoff = v[..., -1, None]
     return logits.masked_fill(logits < cutoff, float("-inf"))
 
-
+# top-p sampling    
 def _apply_top_p(logits: torch.Tensor, p: float) -> torch.Tensor:
     if p <= 0.0 or p >= 1.0:
         return logits
