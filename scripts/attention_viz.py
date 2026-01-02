@@ -61,7 +61,9 @@ def _heatmap(
                     ha="center",
                     va="center",
                     fontsize=7,
-                    color="white" if float(data[i, j]) < float(data.mean()) else "black",
+                    color="white"
+                    if float(data[i, j]) < float(data.mean())
+                    else "black",
                 )
 
 
@@ -119,7 +121,9 @@ def scaled_dot_product_attention(
         mask = torch.triu(torch.ones(t, t, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(mask, float("-inf"))
 
-    probs = torch.softmax(scores, dim=-1)  # row-wise: for each query token, distribution over key tokens
+    probs = torch.softmax(
+        scores, dim=-1
+    )  # row-wise: for each query token, distribution over key tokens
     out = probs @ v  # (B, nh, T, dh)
 
     # Merge heads back: (B, T, D)
@@ -140,8 +144,15 @@ def scaled_dot_product_attention(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize self-attention with annotated plots.")
-    parser.add_argument("--outdir", type=str, default="artifacts/attn_viz", help="Output directory for PNGs.")
+    parser = argparse.ArgumentParser(
+        description="Visualize self-attention with annotated plots."
+    )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default="artifacts/attn_viz",
+        help="Output directory for PNGs.",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--B", type=int, default=1)
     parser.add_argument("--T", type=int, default=6)
@@ -149,7 +160,9 @@ def main() -> None:
     parser.add_argument("--n_head", type=int, default=2)
     parser.add_argument("--head", type=int, default=0, help="Which head to visualize.")
     parser.add_argument("--causal", action="store_true", help="Apply causal mask.")
-    parser.add_argument("--annotate", action="store_true", help="Write numeric values into heatmaps.")
+    parser.add_argument(
+        "--annotate", action="store_true", help="Write numeric values into heatmaps."
+    )
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -157,13 +170,15 @@ def main() -> None:
     if d % nh != 0:
         raise SystemExit(f"--D ({d}) must be divisible by --n_head ({nh})")
     if not (0 <= args.head < nh):
-        raise SystemExit(f"--head must be in [0, {nh-1}]")
+        raise SystemExit(f"--head must be in [0, {nh - 1}]")
 
     torch.manual_seed(args.seed)
     # Tiny toy input: (B, T, D). Think of each row as a token embedding.
     x = torch.randn(b, t, d)
 
-    tensors = scaled_dot_product_attention(x, n_head=nh, causal=args.causal, seed=args.seed + 1)
+    tensors = scaled_dot_product_attention(
+        x, n_head=nh, causal=args.causal, seed=args.seed + 1
+    )
     dh = int(tensors["d_head"].item())
 
     # Choose a single (batch, head) slice for visualization.
@@ -174,7 +189,7 @@ def main() -> None:
     V = tensors["v"][bh, h]  # (T, dh)
     S = tensors["scores"][bh, h]  # (T, T)
     P = tensors["probs"][bh, h]  # (T, T)
-    O = tensors["out"][bh, h]  # (T, dh)
+    Out = tensors["out"][bh, h]  # (T, dh)
 
     token_labels = [f"t{i}" for i in range(t)]
     dim_labels = [f"d{i}" for i in range(dh)]
@@ -248,7 +263,8 @@ def main() -> None:
     _heatmap(
         ax,
         S,
-        title=f"Scores = Q K^T / sqrt(dh)  shape=(T,T)=({t},{t})" + ("  [causal masked]" if args.causal else ""),
+        title=f"Scores = Q K^T / sqrt(dh)  shape=(T,T)=({t},{t})"
+        + ("  [causal masked]" if args.causal else ""),
         x_label="key token index",
         y_label="query token index",
         xticks=token_labels,
@@ -277,7 +293,7 @@ def main() -> None:
     fig, ax = plt.subplots(1, 1, figsize=(4, 4))
     _heatmap(
         ax,
-        O,
+        Out,
         title=f"Output = probs @ V  shape=(T, dh)=({t},{dh})",
         x_label="head_dim",
         y_label="token index",
@@ -300,13 +316,15 @@ def main() -> None:
     axes[0].grid(True, axis="y", alpha=0.3)
 
     # Show the weighted-sum result for that token (a dh-dimensional vector)
-    out_vec = O[query_idx]  # (dh,)
+    out_vec = Out[query_idx]  # (dh,)
     axes[1].bar(dim_labels, out_vec.detach().cpu().float().numpy())
     axes[1].set_title(f"Output vector for t{query_idx} (head {h}) = Σ_j w_j * V_j")
     axes[1].set_xlabel("head_dim")
     axes[1].set_ylabel("value")
     axes[1].grid(True, axis="y", alpha=0.3)
-    fig.suptitle("The core idea: output token is a weighted sum of value vectors", y=1.05)
+    fig.suptitle(
+        "The core idea: output token is a weighted sum of value vectors", y=1.05
+    )
     _save(fig, outdir / "06_weighted_sum.png")
 
     # Write a tiny textual summary to help navigate the plots.
@@ -341,5 +359,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
