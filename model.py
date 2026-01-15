@@ -1,6 +1,12 @@
+from __future__ import annotations
+
+import inspect
+import math
 from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import tiktoken
 
@@ -15,6 +21,7 @@ torch.manual_seed(1337)
 @dataclass
 class GPT2Config:
     sequence_window_size: int = 1024
+    # GPT-2 vocab_size of 50257; in training we often pad to a multiple of 64 for efficiency.
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
@@ -27,6 +34,18 @@ class GPT2Config:
 # gpt2 model
 
 
+class LayerNorm(nn.Module):
+    """LayerNorm with optional bias (PyTorch LayerNorm can't do bias=False directly)."""
+
+    def __init__(self, ndim: int, *, bias: bool):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
 class GPT2Attention(nn.Module):
     def __init__(self, config: GPT2Config):
         super().__init__()
@@ -35,17 +54,23 @@ class GPT2Attention(nn.Module):
             config.n_embd, 3 * config.n_embd, bias=config.bias
         )  # [Q|K|V] fused for speed
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
-        # Causal mask buffer (matches HF naming: `attn.bias`), not a Parameter.
-        self.register_buffer(
-            "bias",
-            torch.tril(
-                torch.ones(config.sequence_window_size, config.sequence_window_size)
-            ).view(1, 1, config.sequence_window_size, config.sequence_window_size),
-            persistent=False,
-        )
+        self.dropout = config.dropout
+        # Flash attention is available in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if not self.flash:
+            # Causal mask buffer (matches HF naming: `attn.bias`), not a Parameter.
+            self.register_buffer(
+                "bias",
+                torch.tril(
+                    torch.ones(config.sequence_window_size, config.sequence_window_size)
+                ).view(1, 1, config.sequence_window_size, config.sequence_window_size),
+                persistent=False,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -56,15 +81,26 @@ class GPT2Attention(nn.Module):
         K = K.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, T, D)
         V = V.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, T, D)
 
-        att = (Q @ K.transpose(-2, -1)) * (
-            self.head_dim**-0.5
-        )  # (B, H, T, T) -- attention scores
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = att.softmax(dim=-1)
-
-        Y = att @ V  # (B, H, T, D) -- weighted sum of values
+        if self.flash:
+            # (B, H, T, D) x (B, H, T, D) -> (B, H, T, D)
+            Y = torch.nn.functional.scaled_dot_product_attention(
+                Q,
+                K,
+                V,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            att = (Q @ K.transpose(-2, -1)) * (
+                self.head_dim**-0.5
+            )  # (B, H, T, T) -- attention scores
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = att.softmax(dim=-1)
+            att = self.attn_dropout(att)
+            Y = att @ V  # (B, H, T, D) -- weighted sum of values
         Y = Y.transpose(1, 2).contiguous().view(B, T, D)  # (B, T, D) -- merge heads
-        return self.c_proj(Y)
+        return self.resid_dropout(self.c_proj(Y))
 
 
 class GPT2MLP(nn.Module):
@@ -73,17 +109,21 @@ class GPT2MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.act = nn.GELU()
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.c_proj(self.act(self.c_fc(x)))
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        return self.dropout(x)
 
 
 class GPT2Block(nn.Module):
     def __init__(self, config: GPT2Config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = GPT2Attention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = GPT2MLP(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -100,22 +140,60 @@ class GPT2Model(nn.Module):
             {
                 "wte": nn.Embedding(config.vocab_size, config.n_embd),
                 "wpe": nn.Embedding(config.sequence_window_size, config.n_embd),
+                "drop": nn.Dropout(config.dropout),
                 "h": nn.ModuleList([GPT2Block(config) for _ in range(config.n_layer)]),
-                "ln_f": nn.LayerNorm(config.n_embd),
+                "ln_f": LayerNorm(config.n_embd, bias=config.bias),
             }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Weight tying: use token embedding weights for lm_head.
+        self.transformer["wte"].weight = self.lm_head.weight
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Init all weights
+        self.apply(self._init_weights)
+        # Special scaled init to residual projections, per GPT-2 paper.
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight"):
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
+                )
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def get_num_params(self, *, non_embedding: bool = True) -> int:
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer["wpe"].weight.numel()
+        return n_params
+
+    def forward(
+        self, x: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         B, T = x.shape
+        if T > self.config.sequence_window_size:
+            raise ValueError(
+                f"Cannot forward sequence of length {T}, sequence_window_size is only {self.config.sequence_window_size}"
+            )
+
         pos = torch.arange(0, T, dtype=torch.long, device=x.device)
-        tok_emb = self.transformer["wte"](x)
-        pos_emb = self.transformer["wpe"](pos)
-        x = tok_emb + pos_emb
+        tok_emb = self.transformer["wte"](x)  # (B, T, D)
+        pos_emb = self.transformer["wpe"](pos)  # (T, D)
+        h = self.transformer["drop"](tok_emb + pos_emb)
         for block in self.transformer["h"]:
-            x = block(x)
-        x = self.transformer["ln_f"](x)
-        return self.lm_head(x)
+            h = block(h)
+        h = self.transformer["ln_f"](h)
+        logits = self.lm_head(h)  # (B, T, V)
+
+        if targets is None:
+            return logits
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     def generate(
         self,
@@ -126,6 +204,20 @@ class GPT2Model(nn.Module):
     ) -> torch.Tensor:
         """Convenience wrapper around the standalone `generate` function."""
         return generate(self, x, max_new_tokens=max_new_tokens, cfg=cfg)
+
+    def crop_sequence_window_size(self, sequence_window_size: int) -> None:
+        """Model surgery: shrink the context window (pos-emb + causal mask)."""
+        if sequence_window_size > self.config.sequence_window_size:
+            raise ValueError(
+                f"sequence_window_size must be <= {self.config.sequence_window_size}, got {sequence_window_size}"
+            )
+        self.config.sequence_window_size = int(sequence_window_size)
+        self.transformer["wpe"].weight = nn.Parameter(
+            self.transformer["wpe"].weight[:sequence_window_size]
+        )
+        for block in self.transformer["h"]:
+            if hasattr(block.attn, "bias"):
+                block.attn.bias = block.attn.bias[:, :, :sequence_window_size, :sequence_window_size]
 
     @classmethod
     def from_pretrained(
@@ -194,6 +286,47 @@ class GPT2Model(nn.Module):
                     sd[k].copy_(v)
 
         return model
+
+    def configure_optimizers(
+        self,
+        *,
+        weight_decay: float,
+        learning_rate: float,
+        betas: tuple[float, float],
+        device_type: str,
+    ) -> torch.optim.Optimizer:
+        """AdamW with weight decay only on 2D+ params (matmuls + embeddings)."""
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = bool(fused_available and device_type == "cuda")
+        extra_args = {"fused": True} if use_fused else {}
+        return torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, **extra_args
+        )
+
+    def estimate_mfu(self, *, fwdbwd_per_iter: int, dt: float) -> float:
+        """Estimate MFU in units of A100 bfloat16 peak FLOPS."""
+        N = self.get_num_params()
+        cfg = self.config
+        L = cfg.n_layer
+        H = cfg.n_head
+        Q = cfg.n_embd // cfg.n_head
+        T = cfg.sequence_window_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        flops_promised = 312e12  # A100 bf16 peak FLOPS (312 TFLOPS)
+        return flops_achieved / flops_promised
 
 
 if __name__ == "__main__":
