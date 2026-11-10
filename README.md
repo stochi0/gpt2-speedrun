@@ -237,3 +237,18 @@ Selected fields:
 ```bash
 uv run ruff check .
 ```
+
+## Citation
+
+<!-- BEGIN generated citations -->
+
+```bibtex
+@software{bodadeprojectgpt2speedrun,
+  author = {Bodade, Ayush},
+  title = {{GPT-2 Speedrun}},
+  url = {https://github.com/stochi0/gpt2-speedrun},
+  note = {Software implementation; cite the original research separately. Specify the commit or version used.}
+}
+```
+
+<!-- END generated citations -->
